@@ -21,7 +21,7 @@ on:
         type: boolean
         default: false
       bundle_prefix:
-        description: "包名前缀，必须改成你自己的（例 com.zhangsan）"
+        description: "com.zhangs"
         required: true
         default: com.example
       gen_base:
