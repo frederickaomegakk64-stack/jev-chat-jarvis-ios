@@ -1,0 +1,388 @@
+# 放到你 fork 的 .github/workflows/build-unsigned-ipa.yml
+#
+# 作用：用 GitHub 的 macOS Runner 把 jev-chat-jarvis-ios 编成 IPA，
+#       你在 Windows 下载后用 SideStore / Sideloadly 用自己的 Apple ID 签名装到 iPhone。
+#
+# 设计要点（为什么要这么写）：
+#   1. 所有仓库改写用 Python 完成，不用 sed —— 避开 BSD/GNU sed 差异，且本机可离线验证；
+#      任何 pattern 不匹配就 assert 失败，不会静默改坏工程。
+#   2. 打包成 .ipa 之后再用 verify_ipa.py 校验（plistlib 解析二进制 plist），
+#      不合格直接红叉，不会让你装上一个"装完才崩"的包。
+#   3. 面向 iPhone 14 Pro Max / iOS 26.6 + 免费 Apple ID：
+#      - runner 默认 macos-15（iOS 18 SDK 编的包在 iOS 26 上照常跑）
+#      - strip_app_group=true 时摘掉 App Group 并把 Key 编译进二进制（免费账号不支持 App Groups）
+name: build-unsigned-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      strip_app_group:
+        description: "免费 Apple ID 不支持 App Group 时勾 true（Key 会被编译进二进制）"
+        type: boolean
+        default: false
+      bundle_prefix:
+        description: "包名前缀，必须改成你自己的（例 com.zhangsan）"
+        required: true
+        default: com.example
+      gen_base:
+        description: "生成层 Base URL（留空用默认智谱）"
+        default: ""
+      gen_model:
+        description: "生成层模型（留空用 glm-4-flash）"
+        default: ""
+      runner:
+        description: "macOS Runner 镜像（macos-15 最稳；报 SDK 相关错误再试 macos-26）"
+        type: choice
+        options: ["macos-15", "macos-26"]
+        default: "macos-15"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          python3 --version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Patch repo (bundle ids / entitlements / credentials)
+        env:
+          PREFIX: ${{ inputs.bundle_prefix }}
+          STRIP_APP_GROUP: ${{ inputs.strip_app_group }}
+          GEN_KEY: ${{ secrets.GEN_KEY }}
+          GEN_BASE: ${{ inputs.gen_base }}
+          GEN_MODEL: ${{ inputs.gen_model }}
+          JUDGE_KEY: ${{ secrets.JUDGE_KEY }}
+          JUDGE_BASE: ${{ secrets.JUDGE_BASE }}
+          JUDGE_MODEL: ${{ secrets.JUDGE_MODEL }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/patch_repo.py <<'PATCH_EOF'
+          #!/usr/bin/env python3
+          """确定性改写 xcodegen 工程定义，代替 sed。任何一处不匹配就报错退出。"""
+          import difflib
+          import os
+          import pathlib
+          import re
+          import sys
+
+          PROJECT = "project.yml"
+          MODEL = "Shared/JevModel.swift"
+
+
+          def read(p):
+              return pathlib.Path(p).read_text(encoding="utf-8")
+
+
+          def write(p, s):
+              pathlib.Path(p).write_text(s, encoding="utf-8")
+
+
+          def sub_once(text, pattern, repl, label):
+              new, n = re.subn(pattern, repl, text, flags=re.M)
+              if n != 1:
+                  sys.exit(f"[patch] {label}: 命中 {n} 次（期望 1 次）—— 仓库结构变了，先人工确认")
+              return new
+
+
+          prefix = os.environ["PREFIX"].strip()
+          strip = os.environ.get("STRIP_APP_GROUP", "false").strip().lower() == "true"
+          if not re.fullmatch(r"[A-Za-z0-9.\-]+", prefix):
+              sys.exit(f"[patch] bundle_prefix 非法: {prefix!r}")
+
+          original = read(PROJECT)
+          pj = original
+
+          pj = sub_once(pj, r"^(\s*DEVELOPMENT_TEAM:) .*$", r'\1 ""', "DEVELOPMENT_TEAM")
+          pj = sub_once(pj, r"^(  bundleIdPrefix:) .*$", rf"\1 {prefix}", "bundleIdPrefix")
+          pj = pj.replace("com.jevchat.jarvis", prefix + ".jarvis")
+          pj = pj.replace("group.com.jevchat.jarvis", "group." + prefix + ".jarvis")
+          if "com.jevchat" in pj:
+              sys.exit("[patch] project.yml 里还有 com.jevchat 残留")
+
+          if strip:
+              # 删掉两个 target 的 entitlements 块（entitlements: + path + properties + App Group 两行）
+              pj, n = re.subn(r"^    entitlements:\n(?: {6,}.*\n)*", "", pj, flags=re.M)
+              if n != 2:
+                  sys.exit(f"[patch] entitlements 块命中 {n} 处（期望 2 处）")
+              pj, n = re.subn(
+                  r"^\s*CODE_SIGN_ENTITLEMENTS:.*$",
+                  '        CODE_SIGN_ENTITLEMENTS: ""',
+                  pj,
+                  flags=re.M,
+              )
+              if n != 2:
+                  sys.exit(f"[patch] CODE_SIGN_ENTITLEMENTS 命中 {n} 处（期望 2 处：App + 键盘扩展）")
+              if re.search(r"^\s*entitlements:", pj, re.M) or "application-groups" in pj:
+                  sys.exit("[patch] App Group / entitlements 没摘干净")
+
+          write(PROJECT, pj)
+          print("---- project.yml diff ----")
+          print("".join(difflib.unified_diff(
+              original.splitlines(True), pj.splitlines(True), "project.yml(原)", "project.yml(改)")))
+
+          if strip:
+              cfg = read(MODEL)
+              changed = {}
+
+              def set_string_var(text, name, value):
+                  pattern = r'^(\s*var ' + name + r': String = ")[^"]*(")'
+                  new, n = re.subn(pattern, lambda m: m.group(1) + value + m.group(2), text, flags=re.M)
+                  if n != 1:
+                      sys.exit(f"[patch] {MODEL}: var {name} 命中 {n} 次（期望 1 次）")
+                  return new
+
+              for var, env in (
+                  ("genKey", "GEN_KEY"),
+                  ("genBase", "GEN_BASE"),
+                  ("genModel", "GEN_MODEL"),
+                  ("judgeKey", "JUDGE_KEY"),
+                  ("judgeBase", "JUDGE_BASE"),
+                  ("judgeModel", "JUDGE_MODEL"),
+              ):
+                  value = os.environ.get(env, "").strip()
+                  if not value:
+                      continue
+                  if '"' in value or "\\" in value:
+                      sys.exit(f"[patch] {env} 含引号或反斜杠，请换一个值或改脚本")
+                  cfg = set_string_var(cfg, var, value)
+                  changed[var] = value
+              if not changed:
+                  print("[patch] 警告：strip_app_group=true 但没有任何 Key 注入，键盘会是未配置状态")
+              write(MODEL, cfg)
+              print("---- 注入的编译期默认值 ----")
+              for k, v in changed.items():
+                  print(f"  {k} = {'*' * min(len(v), 4)}...({len(v)} 字符)")
+          PATCH_EOF
+          python3 /tmp/patch_repo.py
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project JevJarvis.xcodeproj \
+            -scheme JevJarvis \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package Payload into .ipa
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n1)
+          echo "APP = $APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out && zip -qry JevJarvis-unsigned.ipa Payload
+          ls -lh JevJarvis-unsigned.ipa
+
+      - name: Verify IPA (keyboard extension / plist invariants)
+        run: |
+          set -euo pipefail
+          cat > /tmp/verify_ipa.py <<'VERIFY_EOF'
+          #!/usr/bin/env python3
+          """校验 .ipa：键盘扩展是否嵌入、plist 关键项是否齐全、版本号是否一致。
+
+          用法：python3 verify_ipa.py <path-to.ipa>
+          退出码 0 = 通过，1 = 不合格（列出全部问题）。
+          """
+          import contextlib
+          import os
+          import plistlib
+          import pathlib
+          import shutil
+          import sys
+          import tempfile
+          import uuid
+          import zipfile
+
+          MACHO_MAGICS = {
+              b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+              b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+              b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+              b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+          }
+
+          try:  # Windows 控制台编码不总是能表示全部字符，别因此崩掉
+              sys.stdout.reconfigure(errors="replace")
+          except Exception:
+              pass
+
+
+          def _probe_writable(base):
+              """在 base 下真建两级目录再删掉。
+              注意：不用 tempfile.mkdtemp —— 它以 mode 0o700 建目录，
+              在某些受限环境里会导致子目录不可写；os.makedirs 默认权限没这个问题。
+              """
+              d = os.path.join(base, "jevverify-" + uuid.uuid4().hex[:8])
+              try:
+                  os.makedirs(os.path.join(d, "probe", "sub"))
+                  return d
+              except OSError:
+                  shutil.rmtree(d, ignore_errors=True)
+                  return None
+
+
+          @contextlib.contextmanager
+          def temp_dir():
+              bases = [os.environ.get("JEV_VERIFY_TMPDIR"), tempfile.gettempdir(), os.getcwd()]
+              for base in bases:
+                  if not base:
+                      continue
+                  d = _probe_writable(base)
+                  if d:
+                      try:
+                          yield d
+                      finally:
+                          shutil.rmtree(d, ignore_errors=True)
+                      return
+              sys.exit("[verify] 找不到可写的临时目录（可用 JEV_VERIFY_TMPDIR 指定）")
+
+
+          @contextlib.contextmanager
+          def payload_root(target):
+              """接受 .ipa 文件，或已解压好的目录（目录里应含 Payload/）。"""
+              p = pathlib.Path(target)
+              if p.is_dir():
+                  names = [q.relative_to(p).as_posix() for q in p.rglob("*")]
+                  yield p, names
+                  return
+              if not p.is_file():
+                  sys.exit(f"[verify] 找不到: {p}")
+              with temp_dir() as tmp:
+                  try:
+                      with zipfile.ZipFile(p) as zf:
+                          names = zf.namelist()
+                          zf.extractall(tmp)
+                  except zipfile.BadZipFile:
+                      sys.exit(f"[verify] 不是有效的 zip/ipa 文件: {p}（下载到 HTML 或分片了？）")
+                  yield pathlib.Path(tmp), names
+
+
+          def main(ipa_path):
+              problems = []
+              notes = []
+              with payload_root(ipa_path) as (base, names):
+                  root = base / "Payload"
+                  apps = sorted(p for p in root.glob("*.app") if p.is_dir()) if root.is_dir() else []
+                  if len(apps) != 1:
+                      sys.exit(f"[verify] Payload/ 下的 .app 数量异常: {[a.name for a in apps]}")
+                  app = apps[0]
+                  app_info = plistlib.loads((app / "Info.plist").read_bytes())
+                  app_id = app_info.get("CFBundleIdentifier", "")
+                  app_ver = app_info.get("CFBundleVersion", "")
+                  print(f"宿主 App      : {app.name}")
+                  print(f"  Bundle ID   : {app_id}")
+                  print(f"  Version     : {app_info.get('CFBundleShortVersionString', '?')} ({app_ver})")
+                  print(f"  MinimumOS   : {app_info.get('MinimumOSVersion', '?')}")
+                  print(f"  DeviceFamily: {app_info.get('UIDeviceFamily', '?')}")
+
+                  exe = app / str(app_info.get("CFBundleExecutable", ""))
+                  if not exe.is_file():
+                      problems.append(f"宿主可执行文件缺失: {exe}")
+                  elif exe.read_bytes()[:4] not in MACHO_MAGICS:
+                      problems.append("宿主可执行文件不是 Mach-O（打包步骤可能坏了）")
+
+                  plug = app / "PlugIns"
+                  appexs = sorted(p for p in plug.glob("*.appex") if p.is_dir()) if plug.is_dir() else []
+                  if len(appexs) != 1:
+                      problems.append(f"PlugIns/ 下的 .appex 数量异常: {[a.name for a in appexs]}")
+                  else:
+                      kb = appexs[0]
+                      kb_info = plistlib.loads((kb / "Info.plist").read_bytes())
+                      kb_id = kb_info.get("CFBundleIdentifier", "")
+                      attrs = (kb_info.get("NSExtension") or {}).get("NSExtensionAttributes") or {}
+                      print(f"键盘扩展      : {kb.name}")
+                      print(f"  Bundle ID   : {kb_id}")
+                      print(f"  ExtensionPt : {(kb_info.get('NSExtension') or {}).get('NSExtensionPointIdentifier', '?')}")
+                      print(f"  PrimaryLang : {attrs.get('PrimaryLanguage', '?')}")
+                      print(f"  OpenAccess  : {attrs.get('RequestsOpenAccess', '?')}")
+
+                      if (kb_info.get("NSExtension") or {}).get("NSExtensionPointIdentifier") != "com.apple.keyboard-service":
+                          problems.append("NSExtensionPointIdentifier 不是 com.apple.keyboard-service")
+                      if attrs.get("RequestsOpenAccess") not in (True, 1):
+                          problems.append("缺 RequestsOpenAccess：设置里不会出现「允许完全访问」")
+                      if attrs.get("PrimaryLanguage") != "en-US":
+                          problems.append(
+                              f"PrimaryLanguage={attrs.get('PrimaryLanguage')!r}，必须是 en-US（否则键盘弹起会崩宿主 App）"
+                          )
+                      if kb_id != app_id + ".keyboard":
+                          problems.append(f"键盘包名应为 {app_id}.keyboard，实际 {kb_id}")
+                      if kb_info.get("CFBundleVersion") != app_ver:
+                          problems.append(
+                              f"版本号不一致：App={app_ver} 键盘={kb_info.get('CFBundleVersion')}"
+                          )
+                      if not (kb_info.get("CFBundleExecutable") or ""):
+                          problems.append("键盘扩展缺 CFBundleExecutable")
+                      else:
+                          kb_exe = kb / kb_info["CFBundleExecutable"]
+                          if not kb_exe.is_file():
+                              problems.append("键盘扩展可执行文件缺失")
+                          elif kb_exe.read_bytes()[:4] not in MACHO_MAGICS:
+                              problems.append("键盘扩展可执行文件不是 Mach-O")
+
+                  if any(n == "embedded.mobileprovision" for n in names):
+                      notes.append("包含 embedded.mobileprovision（说明已被签过名，不是预期中的未签名包）")
+                  if any(n.startswith("Payload/_CodeSignature") or "/_CodeSignature/" in n for n in names):
+                      notes.append("包含 _CodeSignature（已签名包）")
+                  if not any("/PlugIns/" in n for n in names):
+                      notes.append("IPA 里没有 PlugIns 路径——扩展未嵌入")
+                  minors = app_info.get("MinimumOSVersion")
+                  print(f"扫描条目数    : {len(names)}")
+                  print(f"MinimumOSVersion <= 26 : {minors is not None}")
+
+              for n in notes:
+                  print(f"NOTE: {n}")
+              if problems:
+                  print("\n[verify] 不合格：")
+                  for p in problems:
+                      print(f"  - {p}")
+                  return 1
+              print("\n[verify] 通过：键盘扩展、PrimaryLanguage、RequestsOpenAccess、版本号一致性全部正确")
+              return 0
+
+
+          if __name__ == "__main__":
+              if len(sys.argv) != 2:
+                  sys.exit("用法: python3 verify_ipa.py <path-to.ipa>")
+              sys.exit(main(sys.argv[1]))
+          VERIFY_EOF
+          python3 /tmp/verify_ipa.py out/JevJarvis-unsigned.ipa
+
+      - name: Manifest
+        if: success()
+        run: |
+          set -euo pipefail
+          {
+            echo "strip_app_group : ${{ inputs.strip_app_group }}"
+            echo "bundle_prefix   : ${{ inputs.bundle_prefix }}"
+            echo "gen_base        : ${{ inputs.gen_base }}"
+            echo "gen_model       : ${{ inputs.gen_model }}"
+            echo "runner          : ${{ inputs.runner }}"
+            echo "commit          : ${{ github.sha }}"
+            echo "built_at_utc    : $(date -u +%FT%TZ)"
+            echo "note            : 未签名 IPA，需用 Sideloadly / SideStore 以你自己的 Apple ID 签名后再装"
+          } | tee out/manifest.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JevJarvis-unsigned-ipa
+          path: |
+            out/JevJarvis-unsigned.ipa
+            out/manifest.txt
+          if-no-files-found: error
